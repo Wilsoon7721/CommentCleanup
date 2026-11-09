@@ -1,6 +1,6 @@
 //! Application state, messages and layout
 
-use crate::ai::{self, AiSettings, Preset, Sent, Suggested};
+use crate::ai::{self, AiSettings, Preset, Provider, Sent, Suggested};
 use crate::cleanup::{self, Applied, Change};
 use crate::files::{self, Entry, Loaded};
 use crate::find::{self, FindMatch, Query, SearchFile};
@@ -90,7 +90,6 @@ const PALETTE_ROWS: usize = 12;
 /// How far ahead suggestions are fetched while going through all.
 const AHEAD_COMMENTS: usize = 3;
 const AHEAD_AT_ONCE: usize = 2;
-/// After Groq's rate limit, on-demand suggestions carry on but fetching ahead waits.
 const AHEAD_PAUSE: Duration = Duration::from_secs(30);
 const SUGGEST_COOLDOWN: Duration = Duration::from_secs(30);
 const SPINNER: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"><path d="M12 3a9 9 0 1 1-9 9"/></svg>"##;
@@ -499,7 +498,7 @@ pub enum Message {
     AiKeySave,
     AiKeyRemove,
     AiModelInput(String),
-    AiModelsLoaded(Result<Vec<String>, String>),
+    AiModelsLoaded(ai::Provider, Result<Vec<String>, String>),
     AiPresetPicked(Preset),
     AiCustomEdited(text_editor::Action),
     AiIncludeFunction(bool),
@@ -566,6 +565,9 @@ pub enum Message {
     FixModePicked(FixMode),
     AiSuggestAhead(bool),
     SuggestedAhead(u64, PathBuf, u64, Result<Suggested, String>),
+    AiProviderPicked(Provider),
+    AiCustomUrlInput(String),
+    AiCustomUrlSubmit,
     OpenPalette,
     ClosePalette,
     PaletteInput(String),
@@ -646,6 +648,7 @@ impl App {
             ]);
         }
         let ai = AiSettings::load();
+        let ai_has_key = ai::has_key(ai.provider);
         let mut app = Self {
             options,
             highlighter: None,
@@ -699,7 +702,7 @@ impl App {
             ai_custom: text_editor::Content::with_text(&ai.custom),
             ai,
             ai_key_input: String::new(),
-            ai_has_key: ai::has_key(),
+            ai_has_key,
             ai_models: Vec::new(),
             ai_models_error: None,
             suggestion: None,
@@ -1495,7 +1498,7 @@ impl App {
 
     fn suggesting_ahead(&self) -> bool {
         self.ai.suggest_ahead
-            && self.ai_has_key
+            && self.ai_ready()
             && !self.ai.model.trim().is_empty()
             && self.ai.instructions().is_some()
             && self.tab().is_some_and(|tab| tab.review.is_some() && tab.read_only.is_none())
@@ -1504,6 +1507,7 @@ impl App {
     fn suggestion_request(&self, tab: &Tab, hunk: &Hunk, rejected: Vec<String>) -> Option<(Arc<Highlighter>, ai::Request)> {
         let highlighter = self.highlighter.clone()?;
         let request = ai::Request {
+            endpoint: self.ai.endpoint(),
             path: tab.path.clone(),
             theme: self.theme_name.clone(),
             doc: tab.doc.clone(),
@@ -1518,7 +1522,11 @@ impl App {
     }
 
     fn suggestion_settings(&self, tab: &Tab, key: u64) -> (String, String, bool) {
-        (self.ai.model.trim().to_owned(), self.ai.instructions().unwrap_or_default(), self.includes_function(tab, key))
+        (
+            format!("{}/{}", self.ai.provider.name(), self.ai.model.trim()),
+            self.ai.instructions().unwrap_or_default(),
+            self.includes_function(tab, key),
+        )
     }
 
     fn suggestion_gate(&self, tab: &Tab, hunk: &Hunk, retrying: bool) -> SuggestGate {
@@ -1679,8 +1687,17 @@ impl App {
         }
     }
 
+    fn ai_ready(&self) -> bool {
+        if self.ai.provider == Provider::Custom && self.ai.custom_url.trim().is_empty() {
+            return false;
+        }
+        !self.ai.provider.requires_key() || self.ai_has_key
+    }
+
     fn fetch_models(&self) -> Task<Message> {
-        background(move || { ai::list_models() }, Message::AiModelsLoaded)
+        let endpoint = self.ai.endpoint();
+        let provider = endpoint.provider;
+        background(move || { ai::list_models(endpoint) }, move |result| Message::AiModelsLoaded(provider, result))
     }
 
     fn ask_in_settings(&mut self, status: &str) -> Task<Message> {
@@ -1690,8 +1707,12 @@ impl App {
     }
 
     fn start_suggestion(&mut self, rejected: Vec<String>) -> Task<Message> {
-        if !self.ai_has_key {
-            return self.ask_in_settings("Add your Groq API key to get suggestions.");
+        if !self.ai_ready() {
+            let prompt = match self.ai.provider {
+                Provider::Custom => "Add your server's address to get suggestions.".to_owned(),
+                provider => format!("Add your {} API key to get suggestions.", provider.name()),
+            };
+            return self.ask_in_settings(&prompt);
         }
         if self.ai.model.trim().is_empty() {
             return self.ask_in_settings("Choose a model to get suggestions.");
@@ -2270,6 +2291,28 @@ impl App {
                 }
                 self.ahead.insert(key, state);
                 self.top_up_ahead()
+            }
+            Message::AiProviderPicked(provider) => {
+                if provider == self.ai.provider {
+                    return Task::none();
+                }
+                self.ai.use_provider(provider);
+                self.ai_has_key = ai::has_key(provider);
+                self.ai_key_input.clear();
+                self.ai_models.clear();
+                self.ai_models_error = None;
+                self.save_ai();
+                if self.ai_ready() { self.fetch_models() } else { Task::none() }
+            }
+            Message::AiCustomUrlInput(value) => {
+                self.ai.custom_url = value;
+                self.ai_models.clear();
+                self.ai_models_error = None;
+                self.save_ai();
+                Task::none()
+            }
+            Message::AiCustomUrlSubmit => {
+                if self.ai_ready() { self.fetch_models() } else { Task::none() }
             }
             Message::OpenPalette => {
                 self.palette_open = true;
@@ -3069,7 +3112,7 @@ impl App {
                 if key.trim().is_empty() {
                     return Task::none();
                 }
-                match ai::save_key(&key) {
+                match ai::save_key(self.ai.provider, &key) {
                     Ok(()) => {
                         self.ai_has_key = true;
                         self.ai_models.clear();
@@ -3084,7 +3127,7 @@ impl App {
                 }
             }
             Message::AiKeyRemove => {
-                match ai::remove_key() {
+                match ai::remove_key(self.ai.provider) {
                     Ok(()) => {
                         self.ai_has_key = false;
                         self.ai_models.clear();
@@ -3100,7 +3143,10 @@ impl App {
                 self.save_ai();
                 Task::none()
             }
-            Message::AiModelsLoaded(result) => {
+            Message::AiModelsLoaded(provider, result) => {
+                if provider != self.ai.provider {
+                    return Task::none();
+                }
                 match result {
                     Ok(models) => {
                         self.ai_models = models;
@@ -3244,7 +3290,7 @@ impl App {
                     }
                     return self.restore_code_scroll();
                 }
-                let models = self.ai_has_key && self.ai_models.is_empty();
+                let models = self.ai_ready() && self.ai_models.is_empty();
                 let models = if models { self.fetch_models() } else { Task::none() };
                 self.update_rule_sample();
                 Task::batch([models, self.test_rules()])
@@ -4988,10 +5034,17 @@ impl App {
         .spacing(8);
 
         let field = |label: &'static str| text(label).size(13).width(240);
-        let key_placeholder = if self.ai_has_key { "Saved. Paste a new key to replace it." } else { "Paste your Groq API key" };
+        let provider = self.ai.provider;
+        let key_placeholder = if self.ai_has_key {
+            "Saved. Paste a new key to replace it.".to_owned()
+        } else if provider.requires_key() {
+            format!("Paste your {} API key", provider.name())
+        } else {
+            "Only if your server needs one".to_owned()
+        };
         let mut key_row = row![
-            field("Groq API key"),
-            text_input(key_placeholder, &self.ai_key_input)
+            field("API key"),
+            text_input(&key_placeholder, &self.ai_key_input)
                 .secure(true)
                 .on_input(Message::AiKeyInput)
                 .on_submit(Message::AiKeySave)
@@ -5014,12 +5067,14 @@ impl App {
         }
         let key_note = match &self.ai_models_error {
             Some(error) => error.as_str(),
+            None if provider == Provider::Ollama => "Runs on this computer, so no key is needed. Start Ollama, then choose a model.",
             None if self.ai_has_key => "Encrypted for your Windows account and stored apart from your settings.",
             None => "Encrypted for your Windows account when saved.",
         };
+        let model_placeholder = if provider.default_model().is_empty() { "Model name" } else { provider.default_model() };
         let mut model_row = row![
             field("Model"),
-            text_input(ai::DEFAULT_MODEL, &self.ai.model)
+            text_input(model_placeholder, &self.ai.model)
                 .on_input(Message::AiModelInput)
                 .size(13)
                 .padding([3, 6])
@@ -5037,9 +5092,37 @@ impl App {
                     .width(200),
             );
         }
+        let provider_row = row![
+            field("Provider"),
+            pick_list(&Provider::ALL[..], Some(provider), Message::AiProviderPicked)
+                .text_size(13)
+                .padding([3, 8])
+                .width(280),
+        ]
+        .spacing(6)
+        .align_y(iced::Center);
+        let mut connection = column![provider_row].spacing(8);
+        if provider == Provider::Custom {
+            connection = connection.push(
+                row![
+                    field("Server address"),
+                    text_input("https://example.com/v1", &self.ai.custom_url)
+                        .on_input(Message::AiCustomUrlInput)
+                        .on_submit(Message::AiCustomUrlSubmit)
+                        .size(13)
+                        .padding([3, 6])
+                        .width(280),
+                ]
+                .spacing(6)
+                .align_y(iced::Center),
+            );
+        }
+        if provider.takes_key() {
+            connection = connection.push(key_row);
+        }
         let mut suggestions = column![
             heading("AI suggestions", "Applies to every folder."),
-            key_row,
+            connection,
             row![space::horizontal().width(246), text(key_note).size(12)],
             model_row,
             row![
@@ -5070,7 +5153,7 @@ impl App {
                     .text_size(13)
                     .size(15)
                     .on_toggle(Message::AiIncludeFunction),
-                text("The default for each comment; { } on the toolbar changes it for one comment. Suggest sends the comment and its language to Groq, plus the whole function when this is on.").size(12),
+                text(format!("The default for each comment; {{ }} on the toolbar changes it for one comment. Suggest sends the comment and its language to {}, plus the whole function when this is on.", provider.name())).size(12),
             ]
             .spacing(4),
         );
@@ -5081,7 +5164,7 @@ impl App {
                     .text_size(13)
                     .size(15)
                     .on_toggle(Message::AiSuggestAhead),
-                text("Each comment opens with a suggestion ready: Enter approves, Esc keeps the comment and moves on. Sends up to the next three comments to Groq as you go.").size(12),
+                text(format!("Each comment opens with a suggestion ready: Enter approves, Esc keeps the comment and moves on. Sends the next few comments to {} as you go.", provider.name())).size(12),
             ]
             .spacing(4),
         );
