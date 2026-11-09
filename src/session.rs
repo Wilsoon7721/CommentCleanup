@@ -21,6 +21,7 @@ pub struct Session {
     pub manual_updates: bool,
     /// (version, release notes), to show once that version has started.
     pub whats_new: Option<(String, String)>,
+    pub just_changed: bool,
 }
 
 fn path() -> Option<PathBuf> {

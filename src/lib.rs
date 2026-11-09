@@ -19,3 +19,4 @@ pub mod update;
 pub mod viewer;
 pub mod vscode;
 pub mod window_state;
+pub mod word_diff;

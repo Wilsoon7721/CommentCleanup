@@ -7,6 +7,7 @@ use crate::find::{self, FindMatch, Query, SearchFile};
 use crate::git::{self, Changed, FileState, Repo};
 use crate::highlight::{Document, Highlighter, Hunk, HunkKind, parse_hex};
 use crate::palette;
+use crate::word_diff::{self, Piece};
 use crate::rules::{self, Decision, Rules, Settings};
 use crate::scan::{self, FolderUndo, ImpactFile, Plan, PlanFile, PlanFileChanges, PlanItem, PlanOutcome, RuleImpact, ScannedFile, Tally};
 use crate::session::{self, Session};
@@ -90,6 +91,8 @@ const PALETTE_ROWS: usize = 12;
 /// How far ahead suggestions are fetched while going through all.
 const AHEAD_COMMENTS: usize = 3;
 const AHEAD_BATCH: usize = 8;
+const JUST_CHANGED_HEIGHT: f32 = 132.0;
+const JUST_CHANGED_ROWS: usize = 100;
 const AHEAD_PAUSE: Duration = Duration::from_secs(30);
 const SUGGEST_COOLDOWN: Duration = Duration::from_secs(30);
 const SPINNER: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"><path d="M12 3a9 9 0 1 1-9 9"/></svg>"##;
@@ -280,6 +283,46 @@ enum MenuEntry {
     Separator,
 }
 
+struct ChangedComment {
+    line: usize,
+    before: Vec<Piece>,
+    after: Option<Vec<Piece>>,
+}
+
+struct JustChanged {
+    path: PathBuf,
+    name: String,
+    comments: Vec<ChangedComment>,
+    hidden: usize,
+    after_hash: u64,
+}
+
+fn describe_changes(path: PathBuf, name: String, changes: &[(Hunk, Change)]) -> JustChanged {
+    let comments = changes
+        .iter()
+        .take(JUST_CHANGED_ROWS)
+        .map(|(hunk, change)| match change {
+            Change::Replace(replacement) => {
+                let (before, after) = word_diff::compare(&hunk.raw, replacement);
+                ChangedComment { line: hunk.first, before, after: Some(after) }
+            }
+            Change::Delete => ChangedComment { line: hunk.first, before: vec![(hunk.raw.clone(), true)], after: None },
+        })
+        .collect();
+    JustChanged { path, name, comments, hidden: changes.len().saturating_sub(JUST_CHANGED_ROWS), after_hash: 0 }
+}
+
+fn marked_text<'a>(pieces: &'a [Piece], tint: Color) -> Element<'a, Message> {
+    let spans: Vec<Span<'a, (), Font>> = pieces
+        .iter()
+        .map(|(words, changed)| {
+            let span = Span::new(words.as_str());
+            if *changed { span.background(tint) } else { span }
+        })
+        .collect();
+    rich_text(spans).font(Font::with_name("Consolas")).size(12).width(Fill).into()
+}
+
 enum AheadState {
     Loading,
     Ready(Suggested),
@@ -380,6 +423,10 @@ pub struct App {
     git_running: bool,
     git_again: bool,
     only_changed: bool,
+    show_just_changed: bool,
+    last_change: Option<JustChanged>,
+    pending_change: Option<JustChanged>,
+    undo_return: Option<usize>,
     find_open: bool,
     find_query: Query,
     find_matches: Arc<Vec<FindMatch>>,
@@ -569,6 +616,9 @@ pub enum Message {
     AiCustomUrlInput(String),
     AiCustomUrlSubmit,
     AiBatch(bool),
+    ToggleJustChanged,
+    JustChangedBack,
+    JustChangedUndo,
     OpenPalette,
     ClosePalette,
     PaletteInput(String),
@@ -719,6 +769,10 @@ impl App {
             git_running: false,
             git_again: false,
             only_changed: session.only_changed,
+            show_just_changed: session.just_changed,
+            last_change: None,
+            pending_change: None,
+            undo_return: None,
             find_open: false,
             find_query: Query::default(),
             find_matches: Arc::new(Vec::new()),
@@ -812,6 +866,7 @@ impl App {
             ignored: self.ignored_store.clone(),
             window: self.placement,
             only_changed: self.only_changed,
+            just_changed: self.show_just_changed,
             manual_updates: !self.auto_update,
             whats_new: self.update_notes.clone(),
         };
@@ -1909,6 +1964,7 @@ impl App {
         let hash = tab.hash;
         let doc = tab.doc.clone();
         let theme = self.theme_name.clone();
+        self.pending_change = Some(describe_changes(path.clone(), tab.name.clone(), &changes));
         self.busy = true;
         background(
             move || { cleanup::apply_changes(&highlighter, &path, &theme, hash, &doc, &changes) },
@@ -1972,6 +2028,7 @@ impl App {
                 ("o", true) => Message::PickFolder,
                 ("w", false) => Message::CloseFile,
                 ("b", false) if self.root.is_some() => Message::ToggleSidebar,
+                ("j", false) => Message::ToggleJustChanged,
                 (",", false) => Message::ToggleSettings,
                 ("f", false) if self.tab().is_some() && !typing_elsewhere => Message::OpenFind,
                 ("f", true) => Message::OpenSearch,
@@ -2345,6 +2402,41 @@ impl App {
                 self.ai.batch = value;
                 self.save_ai();
                 Task::none()
+            }
+            Message::ToggleJustChanged => {
+                self.show_just_changed = !self.show_just_changed;
+                self.save_session();
+                Task::none()
+            }
+            Message::JustChangedBack => {
+                let Some((path, line)) = self
+                    .last_change
+                    .as_ref()
+                    .and_then(|change| Some((change.path.clone(), change.comments.first()?.line)))
+                else {
+                    return Task::none();
+                };
+                let Some(index) = self.tabs.iter().position(|tab| tab.path == path) else {
+                    return Task::none();
+                };
+                let activate = if self.active == Some(index) { Task::none() } else { self.activate(index) };
+                let target = self.tab().and_then(|tab| tab.doc.hunks.iter().position(|hunk| hunk.first == line));
+                let jump = match target {
+                    Some(hunk) => self.jump_to(hunk),
+                    None => {
+                        self.select(None);
+                        scroll_code(0.0, line.saturating_sub(CONTEXT_LINES) as f32 * LINE_HEIGHT)
+                    }
+                };
+                activate.chain(jump)
+            }
+            Message::JustChangedUndo => {
+                self.undo_return = self
+                    .last_change
+                    .as_ref()
+                    .filter(|change| change.comments.len() == 1)
+                    .map(|change| change.comments[0].line);
+                self.update(Message::Undo)
             }
             Message::OpenPalette => {
                 self.palette_open = true;
@@ -3014,6 +3106,7 @@ impl App {
             Message::Do(action) => self.run_action(action),
             Message::Applied(path, result) => {
                 self.busy = false;
+                let pending = self.pending_change.take();
                 let index = self.tabs.iter().position(|t| t.path == path);
                 match (result, index) {
                     (Ok(applied), Some(index)) => {
@@ -3021,6 +3114,10 @@ impl App {
                         self.tabs[index].load_seq += 1;
                         let after_edit = loaded.hash;
                         self.adopt(index, loaded);
+                        if let Some(mut change) = pending {
+                            change.after_hash = after_edit;
+                            self.last_change = Some(change);
+                        }
                         let tab = &mut self.tabs[index];
                         tab.undo.push((previous, after_edit));
                         if tab.undo.len() > MAX_UNDO {
@@ -3296,11 +3393,26 @@ impl App {
                         self.tabs[index].undo.pop();
                         self.adopt(index, loaded);
                         self.status = "Undone.".into();
+                        if self.last_change.as_ref().is_some_and(|change| change.path == path) {
+                            self.last_change = None;
+                        }
+                        let back = self.undo_return.take();
                         if self.active == Some(index) {
-                            return self.run_find(false);
+                            let find = self.run_find(false);
+                            let target = back.and_then(|line| {
+                                self.tab().and_then(|tab| tab.doc.hunks.iter().position(|hunk| hunk.first == line))
+                            });
+                            let jump = match target {
+                                Some(hunk) => self.jump_to(hunk),
+                                None => Task::none(),
+                            };
+                            return Task::batch([find, jump]);
                         }
                     }
-                    (Err(error), _) => self.status = error,
+                    (Err(error), _) => {
+                        self.undo_return = None;
+                        self.status = error;
+                    }
                     _ => {}
                 }
                 Task::none()
@@ -3481,6 +3593,9 @@ impl App {
                     main = main.push(self.settings_page());
                 } else {
                     main = main.push(self.code_area());
+                    if self.show_just_changed && self.tab().is_some() {
+                        main = main.push(self.just_changed_pane());
+                    }
                 }
                 main = main.push(self.status_bar());
                 let mut layout = row![];
@@ -4258,6 +4373,8 @@ impl App {
                 items.push(MenuEntry::Separator);
                 let sidebar = if self.show_sidebar { "Hide Sidebar" } else { "Show Sidebar" };
                 items.push(MenuEntry::Item(sidebar, "Ctrl+B", when(self.root.is_some(), Message::ToggleSidebar)));
+                let just_changed = if self.show_just_changed { "✓ Just Changed Pane" } else { "Just Changed Pane" };
+                items.push(MenuEntry::Item(just_changed, "Ctrl+J", Some(Message::ToggleJustChanged)));
                 items.push(MenuEntry::Item("Settings", "Ctrl+,", Some(Message::ToggleSettings)));
                 items.push(MenuEntry::Item("Command Palette", "Ctrl+Shift+P", Some(Message::OpenPalette)));
                 items.push(MenuEntry::Separator);
@@ -4578,6 +4695,83 @@ impl App {
             space::horizontal().into()
         };
         stack![view, find, toolbar].width(Fill).height(Fill).into()
+    }
+
+    fn just_changed_pane(&self) -> Element<'_, Message> {
+        let flat = self.flat_button(false);
+        let dim = Color { a: 0.6, ..self.palette.foreground };
+        let removed = mix(self.background, Color::from_rgb(0.85, 0.25, 0.25), 0.40);
+        let added = mix(self.background, Color::from_rgb(0.25, 0.7, 0.35), 0.40);
+        let hide = self.tip(
+            button(symbol(glyph::CLOSE, 10.0)).padding([4, 6]).style(flat).on_press(Message::ToggleJustChanged),
+            "Hide (Ctrl+J)",
+        );
+        let action = |label: &'static str, message: Option<Message>| {
+            button(text(label).size(12)).padding([3, 10]).style(flat).on_press_maybe(message)
+        };
+        let mut header = row![text("Just changed").size(12)].spacing(10).align_y(iced::Center);
+        let content: Element<'_, Message> = if let Some(change) = &self.last_change {
+            let title = match change.comments.as_slice() {
+                [only] => format!(
+                    "{}:{}  ·  {}",
+                    change.name,
+                    only.line + 1,
+                    if only.after.is_some() { "changed" } else { "deleted" }
+                ),
+                _ => format!("{} comments in {}", change.comments.len() + change.hidden, change.name),
+            };
+            let single = change.comments.len() == 1;
+            let tab_open = self.tabs.iter().any(|tab| tab.path == change.path);
+            let can_undo = !self.busy
+                && self.tab().is_some_and(|tab| {
+                    tab.path == change.path
+                        && tab.hash == change.after_hash
+                        && tab.undo.last().is_some_and(|(_, hash)| *hash == change.after_hash)
+                });
+            header = header.push(text(title).size(12).color(dim)).push(space::horizontal());
+            if single {
+                header = header.push(action("Go back", (tab_open && !self.busy).then_some(Message::JustChangedBack)));
+            }
+            header = header.push(action("Undo", can_undo.then_some(Message::JustChangedUndo)));
+            let rows = change.comments.iter().map(|comment| -> Element<'_, Message> {
+                let after: Element<'_, Message> = match &comment.after {
+                    Some(pieces) => marked_text(pieces, added),
+                    None => text("Comment deleted").size(12).color(dim).width(Fill).into(),
+                };
+                row![
+                    text((comment.line + 1).to_string()).size(11).color(dim).width(34),
+                    marked_text(&comment.before, removed),
+                    after,
+                ]
+                .spacing(10)
+                .into()
+            });
+            let mut list = column(rows).spacing(8).width(Fill);
+            if change.hidden > 0 {
+                list = list.push(text(format!("and {} more", change.hidden)).size(11).color(dim));
+            }
+            column![
+                row![
+                    space::horizontal().width(34),
+                    text("Before").size(11).color(dim).width(Fill),
+                    text("After").size(11).color(dim).width(Fill),
+                ]
+                .spacing(10)
+                .padding(Padding { right: 12.0, ..Padding::ZERO }),
+                scrollable(list.padding(Padding { right: 12.0, ..Padding::ZERO })).height(Fill),
+            ]
+            .spacing(3)
+            .into()
+        } else {
+            header = header.push(space::horizontal());
+            center(text("The next comment you change will show up here.").size(12).color(dim)).into()
+        };
+        container(column![header.push(hide), content].spacing(4))
+            .padding([5, 10])
+            .width(Fill)
+            .height(JUST_CHANGED_HEIGHT)
+            .style(self.background_style(0.06))
+            .into()
     }
 
     fn floating_toolbar(&self, size: Size) -> Element<'_, Message> {
@@ -5042,6 +5236,11 @@ impl App {
             .unwrap_or(&[]);
         let appearance = column![
             heading("Appearance", "Applies to every folder."),
+            checkbox(self.show_just_changed)
+                .label("Show the Just Changed pane (Ctrl+J)")
+                .text_size(13)
+                .size(15)
+                .on_toggle(|_| Message::ToggleJustChanged),
             row![
                 text("Color theme").size(13).width(240),
                 pick_list(themes, Some(&self.theme_name), Message::ThemePicked)
