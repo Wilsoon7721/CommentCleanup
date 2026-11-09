@@ -24,6 +24,9 @@ const MODELS_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_REPLY_TOKENS: u32 = 2048;
 const FIRST_TEMPERATURE: f32 = 0.3;
 const RETRY_TEMPERATURE: f32 = 0.8;
+const BATCH_CHARS: usize = 16_000;
+const BATCH_BASE_TOKENS: u32 = 1024;
+const BATCH_TOKENS_EACH: u32 = 512;
 const COMMENT_RULES: &str = "Only state what the comment or the supplied code supports. Never invent behaviour.\n\
      Don't add type names, variable names, function names or backticks that the original \
      comment doesn't have, unless the instructions ask for parameters or return values. \
@@ -580,6 +583,22 @@ pub struct Request {
     pub rejected: Vec<String>,
 }
 
+pub struct BatchItem {
+    pub hunk: Hunk,
+    pub include_function: bool,
+}
+
+pub struct BatchRequest {
+    pub endpoint: Endpoint,
+    pub path: PathBuf,
+    pub theme: String,
+    pub doc: Arc<Document>,
+    pub items: Vec<BatchItem>,
+    pub syntax: Option<CommentSyntax>,
+    pub model: String,
+    pub instructions: String,
+}
+
 fn delimiters_sentence(syntax: Option<&CommentSyntax>) -> String {
     let mut delimiters = Vec::new();
     if let Some(syntax) = syntax {
@@ -614,6 +633,68 @@ fn system_prompt(
          {COMMENT_RULES}\n\n\
          Instructions for the comment:\n{instructions}"
     )
+}
+
+fn batch_system_prompt(language: &str, syntax: Option<&CommentSyntax>, instructions: &str) -> String {
+    let delimiters = delimiters_sentence(syntax);
+    format!(
+        "You rewrite several source code comments, each on its own. The code is written in {language}.{delimiters}\n\
+         For every <comment id=\"N\">, write exactly one block:\n\
+         <reply id=\"N\">\nthe replacement comment, exactly as it should appear in the file, including its comment delimiters\n</reply>\n\
+         Reply with only these blocks. No code, no code fences, no explanation.\n\
+         A comment marked inline=\"true\" shares a line with code, so its replacement must be a single line.\n\
+         {COMMENT_RULES}\n\n\
+         Instructions for each comment:\n{instructions}"
+    )
+}
+
+struct BatchComment<'a> {
+    id: usize,
+    raw: &'a str,
+    inline: bool,
+    function: Option<usize>,
+}
+
+fn batch_user_prompt(functions: &[String], comments: &[BatchComment<'_>]) -> String {
+    let mut prompt = String::new();
+    if !functions.is_empty() {
+        prompt.push_str("The functions these comments sit in or above, only so you understand them. Don't narrate their details in a comment:\n");
+        for (index, function) in functions.iter().enumerate() {
+            prompt.push_str(&format!("<function id=\"f{}\">\n{function}\n</function>\n", index + 1));
+        }
+        prompt.push('\n');
+    }
+    prompt.push_str("Comments to rewrite:\n");
+    for comment in comments {
+        let function = comment.function.map(|index| format!(" function=\"f{}\"", index + 1)).unwrap_or_default();
+        let inline = if comment.inline { " inline=\"true\"" } else { "" };
+        prompt.push_str(&format!("<comment id=\"{}\"{function}{inline}>\n{}\n</comment>\n", comment.id, comment.raw));
+    }
+    prompt
+}
+
+fn batch_replies(reply: &str) -> HashMap<usize, String> {
+    const OPEN: &str = "<reply id=\"";
+    const CLOSE: &str = "</reply>";
+    let mut found = HashMap::new();
+    let mut rest = reply;
+    while let Some(start) = rest.find(OPEN) {
+        rest = &rest[start + OPEN.len()..];
+        let Some((id, after_id)) = rest.split_once("\">") else {
+            break;
+        };
+        let Some(end) = after_id.find(CLOSE) else {
+            break;
+        };
+        if let Ok(id) = id.parse() {
+            let text = clean_reply(&after_id[..end]);
+            if !text.is_empty() {
+                found.entry(id).or_insert(text);
+            }
+        }
+        rest = &after_id[end + CLOSE.len()..];
+    }
+    found
 }
 
 fn completion(provider: Provider, model: &str, temperature: f32, max_tokens: u32, system: String, user: String) -> Value {
@@ -757,6 +838,84 @@ pub fn suggest(highlighter: &Highlighter, request: Request) -> Result<Suggested,
     Ok(Suggested { text, sent })
 }
 
+pub type BatchReply = (u64, Option<Result<Suggested, String>>);
+
+pub fn suggest_batch(highlighter: &Highlighter, request: BatchRequest) -> Vec<BatchReply> {
+    let mut functions_sent: Vec<String> = Vec::new();
+    let mut comments: Vec<BatchComment<'_>> = Vec::new();
+    let mut sent_notes: Vec<Sent> = Vec::new();
+    let mut used = 0;
+    for (index, item) in request.items.iter().enumerate() {
+        let (function, sent) = function_context(&request.doc, &item.hunk, item.include_function);
+        let known = function.as_ref().and_then(|text| functions_sent.iter().position(|seen| seen == text));
+        let added = item.hunk.raw.len() + if known.is_none() { function.as_ref().map_or(0, String::len) } else { 0 };
+        if !comments.is_empty() && used + added > BATCH_CHARS {
+            break;
+        }
+        used += added;
+        let function = match (known, function) {
+            (Some(position), _) => Some(position),
+            (None, Some(text)) => {
+                functions_sent.push(text);
+                Some(functions_sent.len() - 1)
+            }
+            (None, None) => None,
+        };
+        comments.push(BatchComment { id: index + 1, raw: &item.hunk.raw, inline: !item.hunk.whole_line, function });
+        sent_notes.push(sent);
+    }
+    let sent_count = comments.len();
+    if sent_count == 1 {
+        let item = &request.items[0];
+        let single = Request {
+            endpoint: request.endpoint.clone(),
+            path: request.path.clone(),
+            theme: request.theme.clone(),
+            doc: request.doc.clone(),
+            hunk: item.hunk.clone(),
+            syntax: request.syntax.clone(),
+            model: request.model.clone(),
+            instructions: request.instructions.clone(),
+            include_function: item.include_function,
+            rejected: Vec::new(),
+        };
+        let mut replies = vec![(item.hunk.key, Some(suggest(highlighter, single)))];
+        replies.extend(request.items[1..].iter().map(|item| (item.hunk.key, None)));
+        return replies;
+    }
+    let body = completion(
+        request.endpoint.provider,
+        &request.model,
+        FIRST_TEMPERATURE,
+        BATCH_BASE_TOKENS + BATCH_TOKENS_EACH * sent_count as u32,
+        batch_system_prompt(&request.doc.language, request.syntax.as_ref(), &request.instructions),
+        batch_user_prompt(&functions_sent, &comments),
+    );
+    let reply = complete(&request.endpoint, body);
+    let mut replies: Vec<BatchReply> = Vec::with_capacity(request.items.len());
+    match reply {
+        Err(error) => {
+            replies.extend(request.items[..sent_count].iter().map(|item| (item.hunk.key, Some(Err(error.clone())))));
+        }
+        Ok(reply) => {
+            let choice = &reply["choices"][0];
+            let cut_off = choice["finish_reason"].as_str() == Some("length");
+            let mut written = batch_replies(choice["message"]["content"].as_str().unwrap_or(""));
+            for (index, (item, sent)) in request.items.iter().zip(sent_notes).enumerate() {
+                let result = match written.remove(&(index + 1)) {
+                    Some(text) => accepted(highlighter, &request.theme, &request.doc, &item.hunk, &text)
+                        .map(|()| Suggested { text, sent }),
+                    None if cut_off => Err("The model ran out of room before finishing. Try again.".into()),
+                    None => Err("The model skipped this comment. Try again.".into()),
+                };
+                replies.push((item.hunk.key, Some(result)));
+            }
+        }
+    }
+    replies.extend(request.items[sent_count..].iter().map(|item| (item.hunk.key, None)));
+    replies
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,6 +961,28 @@ mod tests {
         assert_eq!(body(Provider::Groq)["max_completion_tokens"], 100);
         assert_eq!(body(Provider::Ollama)["max_tokens"], 100);
         assert!(body(Provider::Ollama).get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn batch_replies_are_matched_by_id() {
+        let reply = "noise\n<reply id=\"2\">\n// two\n</reply>\n<reply id=\"1\">\n/* one\n * more */\n</reply>\n<reply id=\"3\">\n// cut";
+        let found = batch_replies(reply);
+        assert_eq!(found[&1], "/* one\n * more */");
+        assert_eq!(found[&2], "// two");
+        assert!(!found.contains_key(&3));
+    }
+
+    #[test]
+    fn a_shared_function_is_only_sent_once() {
+        let comments = [
+            BatchComment { id: 1, raw: "// a", inline: false, function: Some(0) },
+            BatchComment { id: 2, raw: "// b", inline: true, function: Some(0) },
+            BatchComment { id: 3, raw: "// c", inline: false, function: None },
+        ];
+        let prompt = batch_user_prompt(&["fn f() {}".to_owned()], &comments);
+        assert_eq!(prompt.matches("fn f() {}").count(), 1);
+        assert!(prompt.contains("<comment id=\"2\" function=\"f1\" inline=\"true\">"));
+        assert!(prompt.contains("<comment id=\"3\">"));
     }
 
     #[test]

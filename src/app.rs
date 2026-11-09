@@ -89,7 +89,7 @@ const PALETTE_WIDTH: f32 = 560.0;
 const PALETTE_ROWS: usize = 12;
 /// How far ahead suggestions are fetched while going through all.
 const AHEAD_COMMENTS: usize = 3;
-const AHEAD_AT_ONCE: usize = 2;
+const AHEAD_BATCH: usize = 8;
 const AHEAD_PAUSE: Duration = Duration::from_secs(30);
 const SUGGEST_COOLDOWN: Duration = Duration::from_secs(30);
 const SPINNER: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"><path d="M12 3a9 9 0 1 1-9 9"/></svg>"##;
@@ -564,10 +564,11 @@ pub enum Message {
     CloseWhatsNew,
     FixModePicked(FixMode),
     AiSuggestAhead(bool),
-    SuggestedAhead(u64, PathBuf, u64, Result<Suggested, String>),
+    SuggestedAhead(u64, PathBuf, Vec<ai::BatchReply>),
     AiProviderPicked(Provider),
     AiCustomUrlInput(String),
     AiCustomUrlSubmit,
+    AiBatch(bool),
     OpenPalette,
     ClosePalette,
     PaletteInput(String),
@@ -1556,52 +1557,69 @@ impl App {
             return Task::none();
         }
         let paused = self.ahead_paused.is_some_and(|until| Instant::now() < until);
-        let in_flight = self.ahead.values().filter(|state| matches!(state, AheadState::Loading)).count();
+        let in_flight = self.ahead.values().any(|state| matches!(state, AheadState::Loading));
         let Some(tab) = self.tab() else {
             return Task::none();
         };
         let Some(selected) = tab.selected else {
             return Task::none();
         };
-        let candidates: Vec<Hunk> = tab.doc.hunks[selected..]
+        let (batch_size, window) = if self.ai.batch { (AHEAD_BATCH, AHEAD_BATCH) } else { (1, AHEAD_COMMENTS) };
+        let upcoming: Vec<Hunk> = tab.doc.hunks[selected..]
             .iter()
             .filter(|hunk| !tab.dimmed.contains(&hunk.key))
-            .take(AHEAD_COMMENTS)
-            .filter(|hunk| !self.ahead.contains_key(&hunk.key))
+            .take(window)
             .cloned()
             .collect();
-        let epoch = self.ahead_epoch;
-        let mut room = AHEAD_AT_ONCE.saturating_sub(in_flight);
-        let mut tasks = Vec::new();
-        for hunk in candidates {
-            let key = hunk.key;
-            let Some(tab) = self.tab() else {
-                break;
-            };
-            match self.suggestion_gate(tab, &hunk, false) {
-                SuggestGate::Cached(reply) => {
-                    self.ahead.insert(key, AheadState::Ready(reply));
-                }
-                SuggestGate::Ask if room > 0 && !paused => {
-                    let path = tab.path.clone();
-                    let settings = self.suggestion_settings(tab, key);
-                    let Some((highlighter, request)) = self.suggestion_request(tab, &hunk, Vec::new()) else {
-                        continue;
-                    };
-                    room -= 1;
-                    self.suggest_cache.insert(
-                        (path.clone(), key),
-                        CachedSuggestion { asked: Instant::now(), settings, reply: None },
-                    );
-                    self.ahead.insert(key, AheadState::Loading);
-                    tasks.push(background(move || { ai::suggest(&highlighter, request) }, move |result| {
-                        Message::SuggestedAhead(epoch, path, key, result)
-                    }));
-                }
-                _ => {}
+        let mut cached = Vec::new();
+        let mut askable = Vec::new();
+        for hunk in &upcoming {
+            if self.ahead.contains_key(&hunk.key) {
+                continue;
+            }
+            match self.suggestion_gate(tab, hunk, false) {
+                SuggestGate::Cached(reply) => cached.push((hunk.key, reply)),
+                SuggestGate::Ask => askable.push(hunk.clone()),
+                SuggestGate::Wait(_) => {}
             }
         }
-        Task::batch(tasks)
+        let needed = upcoming.iter().take(AHEAD_COMMENTS).any(|hunk| askable.iter().any(|ask| ask.key == hunk.key));
+        let path = tab.path.clone();
+        let doc = tab.doc.clone();
+        let items: Vec<ai::BatchItem> = askable
+            .iter()
+            .take(batch_size)
+            .map(|hunk| ai::BatchItem { hunk: hunk.clone(), include_function: self.includes_function(tab, hunk.key) })
+            .collect();
+        let settings: Vec<(u64, (String, String, bool))> =
+            items.iter().map(|item| (item.hunk.key, self.suggestion_settings(tab, item.hunk.key))).collect();
+        for (key, reply) in cached {
+            self.ahead.insert(key, AheadState::Ready(reply));
+        }
+        if in_flight || paused || !needed {
+            return Task::none();
+        }
+        let (Some(highlighter), Some(instructions)) = (self.highlighter.clone(), self.ai.instructions()) else {
+            return Task::none();
+        };
+        let request = ai::BatchRequest {
+            endpoint: self.ai.endpoint(),
+            path: path.clone(),
+            theme: self.theme_name.clone(),
+            syntax: highlighter.syntax_for(&doc.language).cloned(),
+            doc,
+            items,
+            model: self.ai.model.trim().to_owned(),
+            instructions,
+        };
+        for (key, settings) in settings {
+            self.suggest_cache.insert((path.clone(), key), CachedSuggestion { asked: Instant::now(), settings, reply: None });
+            self.ahead.insert(key, AheadState::Loading);
+        }
+        let epoch = self.ahead_epoch;
+        background(move || { ai::suggest_batch(&highlighter, request) }, move |replies| {
+            Message::SuggestedAhead(epoch, path, replies)
+        })
     }
 
     fn arrive_ahead(&mut self) -> Task<Message> {
@@ -2268,29 +2286,38 @@ impl App {
                 Task::none()
             }
             Message::SpinnerFrame => Task::none(),
-            Message::SuggestedAhead(epoch, path, key, result) => {
-                self.remember_reply(path, key, &result);
-                if epoch != self.ahead_epoch {
-                    return Task::none();
-                }
-                if result.as_ref().is_err_and(|error| error.contains("rate limit")) {
-                    self.ahead_paused = Some(Instant::now() + AHEAD_PAUSE);
-                }
-                let state = match result {
-                    Ok(suggested) => AheadState::Ready(suggested),
-                    Err(error) => AheadState::Failed(error),
-                };
-                if let Some(shown) = self.suggestion.as_mut().filter(|shown| {
-                    shown.key == key && shown.rejected.is_empty() && matches!(shown.state, SuggestionState::Loading)
-                }) {
-                    shown.state = match &state {
-                        AheadState::Ready(suggested) => SuggestionState::Ready(suggested.clone()),
-                        AheadState::Failed(error) => SuggestionState::Failed(error.clone()),
-                        AheadState::Loading => SuggestionState::Loading,
+            Message::SuggestedAhead(epoch, path, replies) => {
+                for (key, outcome) in replies {
+                    let Some(result) = outcome else {
+                        self.suggest_cache.remove(&(path.clone(), key));
+                        if epoch == self.ahead_epoch {
+                            self.ahead.remove(&key);
+                        }
+                        continue;
                     };
+                    self.remember_reply(path.clone(), key, &result);
+                    if epoch != self.ahead_epoch {
+                        continue;
+                    }
+                    if result.as_ref().is_err_and(|error| error.contains("rate limit")) {
+                        self.ahead_paused = Some(Instant::now() + AHEAD_PAUSE);
+                    }
+                    let state = match result {
+                        Ok(suggested) => AheadState::Ready(suggested),
+                        Err(error) => AheadState::Failed(error),
+                    };
+                    if let Some(shown) = self.suggestion.as_mut().filter(|shown| {
+                        shown.key == key && shown.rejected.is_empty() && matches!(shown.state, SuggestionState::Loading)
+                    }) {
+                        shown.state = match &state {
+                            AheadState::Ready(suggested) => SuggestionState::Ready(suggested.clone()),
+                            AheadState::Failed(error) => SuggestionState::Failed(error.clone()),
+                            AheadState::Loading => SuggestionState::Loading,
+                        };
+                    }
+                    self.ahead.insert(key, state);
                 }
-                self.ahead.insert(key, state);
-                self.top_up_ahead()
+                if epoch == self.ahead_epoch { self.top_up_ahead() } else { Task::none() }
             }
             Message::AiProviderPicked(provider) => {
                 if provider == self.ai.provider {
@@ -2313,6 +2340,11 @@ impl App {
             }
             Message::AiCustomUrlSubmit => {
                 if self.ai_ready() { self.fetch_models() } else { Task::none() }
+            }
+            Message::AiBatch(value) => {
+                self.ai.batch = value;
+                self.save_ai();
+                Task::none()
             }
             Message::OpenPalette => {
                 self.palette_open = true;
@@ -5165,6 +5197,17 @@ impl App {
                     .size(15)
                     .on_toggle(Message::AiSuggestAhead),
                 text(format!("Each comment opens with a suggestion ready: Enter approves, Esc keeps the comment and moves on. Sends the next few comments to {} as you go.", provider.name())).size(12),
+            ]
+            .spacing(4),
+        );
+        let suggestions = suggestions.push(
+            column![
+                checkbox(self.ai.batch)
+                    .label("Send upcoming comments together")
+                    .text_size(13)
+                    .size(15)
+                    .on_toggle(Message::AiBatch),
+                text("Asks for up to eight comments in one request, which uses far less of a rate limit. Turn this off if a model does worse with several at once.").size(12),
             ]
             .spacing(4),
         );
