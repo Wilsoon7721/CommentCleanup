@@ -6,6 +6,7 @@ use crate::files::{self, Entry, Loaded};
 use crate::find::{self, FindMatch, Query, SearchFile};
 use crate::git::{self, Changed, FileState, Repo};
 use crate::highlight::{Document, Highlighter, Hunk, HunkKind, parse_hex};
+use crate::hook::{self, HookState};
 use crate::palette;
 use crate::word_diff::{self, Piece};
 use crate::rules::{self, Decision, Rules, Settings};
@@ -427,6 +428,7 @@ pub struct App {
     last_change: Option<JustChanged>,
     pending_change: Option<JustChanged>,
     undo_return: Option<usize>,
+    hook_state: Option<HookState>,
     find_open: bool,
     find_query: Query,
     find_matches: Arc<Vec<FindMatch>>,
@@ -619,6 +621,10 @@ pub enum Message {
     ToggleJustChanged,
     JustChangedBack,
     JustChangedUndo,
+    HookRead(PathBuf, Option<HookState>),
+    HookInstall,
+    HookRemove,
+    HookChanged(PathBuf, Result<HookState, String>),
     OpenPalette,
     ClosePalette,
     PaletteInput(String),
@@ -773,6 +779,7 @@ impl App {
             last_change: None,
             pending_change: None,
             undo_return: None,
+            hook_state: None,
             find_open: false,
             find_query: Query::default(),
             find_matches: Arc::new(Vec::new()),
@@ -898,6 +905,7 @@ impl App {
 
     fn forget_folder_state(&mut self) {
         self.repo = None;
+        self.hook_state = None;
         self.repo_dirs.clear();
         self.search_abort = None;
         self.search_running = false;
@@ -919,7 +927,11 @@ impl App {
         }
         self.git_running = true;
         let reply = root.clone();
-        background(move || { git::read(&root) }, move |repo| Message::GitRead(reply.clone(), repo))
+        let (hook_root, hook_reply) = (root.clone(), root.clone());
+        Task::batch([
+            background(move || { git::read(&root) }, move |repo| Message::GitRead(reply.clone(), repo)),
+            background(move || { hook::state(&hook_root) }, move |state| Message::HookRead(hook_reply.clone(), state)),
+        ])
     }
 
     /// `None` means every comment in this file counts. Otherwise only those on these changed lines do, and a file with no changes has none.
@@ -2437,6 +2449,41 @@ impl App {
                     .filter(|change| change.comments.len() == 1)
                     .map(|change| change.comments[0].line);
                 self.update(Message::Undo)
+            }
+            Message::HookRead(root, state) => {
+                if self.root.as_ref() == Some(&root) {
+                    self.hook_state = state;
+                }
+                Task::none()
+            }
+            Message::HookInstall => {
+                let Some(root) = self.root.clone() else {
+                    return Task::none();
+                };
+                let reply = root.clone();
+                background(move || { hook::install(&root) }, move |result| Message::HookChanged(reply.clone(), result))
+            }
+            Message::HookRemove => {
+                let Some(root) = self.root.clone() else {
+                    return Task::none();
+                };
+                let reply = root.clone();
+                background(move || { hook::remove(&root) }, move |result| Message::HookChanged(reply.clone(), result))
+            }
+            Message::HookChanged(root, result) => {
+                match result {
+                    Ok(state) => {
+                        if self.root.as_ref() == Some(&root) {
+                            self.hook_state = Some(state);
+                        }
+                        self.status = match state {
+                            HookState::Ours => "Commit hook installed for this repository.".into(),
+                            _ => "Commit hook removed.".into(),
+                        };
+                    }
+                    Err(error) => self.status = error,
+                }
+                Task::none()
             }
             Message::OpenPalette => {
                 self.palette_open = true;
@@ -4362,6 +4409,14 @@ impl App {
                 items.push(MenuEntry::Item("Clean Folder…", "", when(self.can_clean_folder(), Message::CleanFolder)));
                 let can_undo_folder = !self.busy && !self.folder_undo.is_empty();
                 items.push(MenuEntry::Item("Undo Folder Cleanup", "", when(can_undo_folder, Message::UndoFolder)));
+                if self.repo.is_some() {
+                    let (hook_label, hook_message) = match self.hook_state {
+                        Some(HookState::Ours) => ("Remove Commit Hook", Some(Message::HookRemove)),
+                        Some(HookState::Foreign) => ("Commit Hook Already in Use", None),
+                        _ => ("Install Commit Hook", Some(Message::HookInstall)),
+                    };
+                    items.push(MenuEntry::Item(hook_label, "", hook_message));
+                }
                 items.push(MenuEntry::Separator);
                 items.push(MenuEntry::Item("Find", "Ctrl+F", when(has_tab, Message::OpenFind)));
                 items.push(MenuEntry::Item("Find in All Files", "Ctrl+Shift+F", when(self.root.is_some(), Message::OpenSearch)));
@@ -4772,6 +4827,36 @@ impl App {
             .height(JUST_CHANGED_HEIGHT)
             .style(self.background_style(0.06))
             .into()
+    }
+
+    fn git_section(&self) -> Element<'_, Message> {
+        if self.repo.is_none() {
+            return column![].into();
+        }
+        let (label, message, note) = match self.hook_state {
+            Some(HookState::Ours) => (
+                "Remove commit hook",
+                Some(Message::HookRemove),
+                "Installed for this repository. Skip it once with git commit --no-verify.",
+            ),
+            Some(HookState::Foreign) => (
+                "Install commit hook",
+                None,
+                "This repository already has a pre-commit hook, so CommentCleanup won't replace it.",
+            ),
+            _ => (
+                "Install commit hook",
+                Some(Message::HookInstall),
+                "Stops a commit when your rules would delete a comment on a staged line. Squash suggestions never stop a commit.",
+            ),
+        };
+        column![
+            text("Commit hook").size(15),
+            text(note).size(12),
+            button(text(label).size(12)).padding([3, 12]).style(button::secondary).on_press_maybe(message),
+        ]
+        .spacing(6)
+        .into()
     }
 
     fn floating_toolbar(&self, size: Size) -> Element<'_, Message> {
@@ -5441,7 +5526,7 @@ impl App {
         ]
         .spacing(8);
 
-        let mut page = column![text("Settings").size(20), appearance, suggestions, self.updates_section()]
+        let mut page = column![text("Settings").size(20), appearance, suggestions, self.updates_section(), self.git_section()]
             .spacing(22)
             .padding(20)
             .max_width(720);

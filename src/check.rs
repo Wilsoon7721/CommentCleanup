@@ -27,6 +27,7 @@ FOLDER defaults to the current folder.
 
 Options:
   --changed     Only comments on lines changed since the last commit
+  --staged      Only comments on lines staged for the next commit
   --no-squash   Don't count comments that would only be squashed
   --editors     Also use grammars from installed editors (results can then
                 differ between machines)
@@ -42,6 +43,7 @@ Exit status: 0 nothing to change, 1 something would change, 2 couldn't check.
 struct Options {
     folder: Option<PathBuf>,
     changed: bool,
+    staged: bool,
     no_squash: bool,
     editors: bool,
     help: bool,
@@ -52,6 +54,7 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
     for argument in arguments {
         match argument.as_str() {
             "--changed" => options.changed = true,
+            "--staged" => options.staged = true,
             "--no-squash" => options.no_squash = true,
             "--editors" => options.editors = true,
             "-h" | "--help" => options.help = true,
@@ -129,7 +132,9 @@ fn check(options: &Options) -> Result<i32, String> {
     if !root.is_dir() {
         return Err(format!("Not a folder: {}", folder.display()));
     }
-    let repo = if options.changed {
+    let repo = if options.staged {
+        Some(git::read_staged(&root).ok_or("--staged needs Git and a repository.")?)
+    } else if options.changed {
         Some(git::read(&root).ok_or("--changed needs Git and a repository.")?)
     } else {
         None

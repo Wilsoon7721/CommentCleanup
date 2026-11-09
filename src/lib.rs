@@ -10,6 +10,7 @@ pub mod find;
 pub mod functions;
 pub mod git;
 pub mod highlight;
+pub mod hook;
 pub mod icons;
 pub mod palette;
 pub mod rules;

@@ -1,7 +1,7 @@
 // No console window in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use commentcleanup::{app, session, update};
+use commentcleanup::{app, check, session, update};
 
 use std::path::PathBuf;
 
@@ -24,10 +24,13 @@ fn window_icon() -> Option<iced::window::Icon> {
 }
 
 fn main() -> iced::Result {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|first| first == "--check") {
+        std::process::exit(check::run(&args[1..]));
+    }
     if update::available() {
         update::clean_up();
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let options = app::Options {
         folder: args.first().filter(|a| !a.starts_with("--")).cloned().map(absolute),
         open: flag(&args, "--open").map(absolute),

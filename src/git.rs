@@ -115,6 +115,28 @@ pub fn read(root: &Path) -> Option<Repo> {
     Some(Repo { branch, files })
 }
 
+pub fn read_staged(root: &Path) -> Option<Repo> {
+    let prefix = String::from_utf8(git(root, &["rev-parse", "--show-prefix"])?).ok()?;
+    let prefix = prefix.trim_end_matches(['\r', '\n']).to_owned();
+    let diff = git(
+        root,
+        &["diff", "--cached", "--unified=0", "--no-color", "--no-ext-diff", "--no-textconv", "--no-relative"],
+    )?;
+    let files = parse_diff(&String::from_utf8_lossy(&diff))
+        .into_iter()
+        .filter_map(|(path, ranges)| {
+            let relative = path.strip_prefix(prefix.as_str())?;
+            Some((root.join(relative), GitFile { state: FileState::Modified, changed: Changed::Ranges(ranges) }))
+        })
+        .collect();
+    Some(Repo { branch: String::new(), files })
+}
+
+pub fn pre_commit_path(root: &Path) -> Option<PathBuf> {
+    let path = String::from_utf8(git(root, &["rev-parse", "--git-path", "hooks/pre-commit"])?).ok()?;
+    Some(root.join(path.trim_end_matches(['\r', '\n'])))
+}
+
 /// The branch, and each file's state. Paths are relative to the repository.
 fn parse_status(output: &str) -> (String, Vec<(String, FileState)>) {
     let mut branch = String::new();
