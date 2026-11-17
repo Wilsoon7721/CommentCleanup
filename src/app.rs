@@ -57,6 +57,8 @@ const MAX_PREVIEW_ITEMS: usize = 300;
 /// Lines shown above a hunk when jumping to it.
 const CONTEXT_LINES: usize = 5;
 const REWORD_EDITOR: &str = "reword";
+const UNDO_PAUSE: Duration = Duration::from_millis(800);
+const MAX_TEXT_UNDO: usize = 200;
 const MENU_BAR_HEIGHT: f32 = 32.0;
 const WINDOW_BUTTON_WIDTH: f32 = 46.0;
 const APP_ICON_SLOT: f32 = 32.0;
@@ -284,6 +286,109 @@ enum MenuEntry {
     Separator,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Field {
+    Reword,
+    Find,
+    Search,
+    Palette,
+    Instructions,
+    Protect,
+    Delete,
+    Sample,
+    Width,
+    Lines,
+    Model,
+    ServerUrl,
+}
+
+impl Field {
+    const ALL: [Field; 12] = [
+        Field::Reword,
+        Field::Find,
+        Field::Search,
+        Field::Palette,
+        Field::Instructions,
+        Field::Protect,
+        Field::Delete,
+        Field::Sample,
+        Field::Width,
+        Field::Lines,
+        Field::Model,
+        Field::ServerUrl,
+    ];
+
+    fn id(self) -> &'static str {
+        match self {
+            Field::Reword => REWORD_EDITOR,
+            Field::Find => FIND_INPUT,
+            Field::Search => SEARCH_INPUT,
+            Field::Palette => PALETTE_INPUT,
+            Field::Instructions => "ai-instructions",
+            Field::Protect => "protect-patterns",
+            Field::Delete => "delete-patterns",
+            Field::Sample => "rule-sample",
+            Field::Width => "squash-width",
+            Field::Lines => "squash-lines",
+            Field::Model => "ai-model",
+            Field::ServerUrl => "ai-server",
+        }
+    }
+
+    fn from_id(id: &Id) -> Option<Field> {
+        Field::ALL.into_iter().find(|field| Id::new(field.id()) == *id)
+    }
+
+    fn edited_by(message: &Message) -> Option<Field> {
+        match message {
+            Message::PaletteInput(_) => Some(Field::Palette),
+            Message::FindInput(_) => Some(Field::Find),
+            Message::SearchInput(_) => Some(Field::Search),
+            Message::SetWidth(_) => Some(Field::Width),
+            Message::SetLines(_) => Some(Field::Lines),
+            Message::AiModelInput(_) => Some(Field::Model),
+            Message::AiCustomUrlInput(_) => Some(Field::ServerUrl),
+            Message::RewordEdited(action) if action.is_edit() => Some(Field::Reword),
+            Message::AiCustomEdited(action) if action.is_edit() => Some(Field::Instructions),
+            Message::ProtectEdited(action) if action.is_edit() => Some(Field::Protect),
+            Message::DeleteEdited(action) if action.is_edit() => Some(Field::Delete),
+            Message::RuleSampleEdited(action) if action.is_edit() => Some(Field::Sample),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct TextHistory {
+    undo: Vec<String>,
+    redo: Vec<String>,
+    last: Option<Instant>,
+    boundary: bool,
+}
+
+struct FocusProbe(Option<Option<Id>>);
+
+impl iced::advanced::widget::Operation<Option<Option<Id>>> for FocusProbe {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<Option<Option<Id>>>)) {
+        operate(self);
+    }
+
+    fn focusable(
+        &mut self,
+        id: Option<&Id>,
+        _bounds: iced::Rectangle,
+        state: &mut dyn iced::advanced::widget::operation::Focusable,
+    ) {
+        if state.is_focused() {
+            self.0 = Some(id.cloned());
+        }
+    }
+
+    fn finish(&self) -> iced::advanced::widget::operation::Outcome<Option<Option<Id>>> {
+        iced::advanced::widget::operation::Outcome::Some(self.0.clone())
+    }
+}
+
 struct ChangedComment {
     line: usize,
     before: Vec<Piece>,
@@ -425,6 +530,8 @@ pub struct App {
     git_again: bool,
     only_changed: bool,
     show_just_changed: bool,
+    histories: HashMap<Field, TextHistory>,
+    restoring: bool,
     last_change: Option<JustChanged>,
     pending_change: Option<JustChanged>,
     undo_return: Option<usize>,
@@ -619,6 +726,7 @@ pub enum Message {
     AiCustomUrlSubmit,
     AiBatch(bool),
     ToggleJustChanged,
+    UndoIn(Option<Option<Id>>, bool),
     JustChangedBack,
     JustChangedUndo,
     HookRead(PathBuf, Option<HookState>),
@@ -776,6 +884,8 @@ impl App {
             git_again: false,
             only_changed: session.only_changed,
             show_just_changed: session.just_changed,
+            histories: HashMap::new(),
+            restoring: false,
             last_change: None,
             pending_change: None,
             undo_return: None,
@@ -1950,6 +2060,7 @@ impl App {
             Action::Reword => {
                 self.suggestion = None;
                 self.reword = Some(text_editor::Content::with_text(&hunk.raw));
+                self.histories.remove(&Field::Reword);
                 operation::focus(Id::new(REWORD_EDITOR))
             }
             Action::Delete => self.start_changes(vec![(hunk, Change::Delete)]),
@@ -2039,6 +2150,8 @@ impl App {
                 return self.update(Message::RewordApply);
             }
             let message = match (letter.as_str(), modifiers.shift()) {
+                ("z", redo) => return self.probe_undo(redo),
+                ("y", false) => return self.probe_undo(true),
                 ("o", false) => Message::PickFile,
                 ("o", true) => Message::PickFolder,
                 ("w", false) => Message::CloseFile,
@@ -2049,7 +2162,6 @@ impl App {
                 ("f", true) => Message::OpenSearch,
                 ("p", true) => Message::OpenPalette,
                 ("s", false) if self.show_settings && self.can_save_rules() => Message::SaveRules,
-                ("z", false) if self.can_undo() && !typing_elsewhere => Message::Undo,
                 _ => return Task::none(),
             };
             return self.update(message);
@@ -2157,7 +2269,100 @@ impl App {
         )
     }
 
+    fn field_text(&self, field: Field) -> Option<String> {
+        Some(match field {
+            Field::Reword => self.reword.as_ref()?.text(),
+            Field::Find => self.find_query.text.clone(),
+            Field::Search => self.search_query.text.clone(),
+            Field::Palette => self.palette_query.clone(),
+            Field::Instructions => self.ai_custom.text(),
+            Field::Protect => self.protect_patterns.text(),
+            Field::Delete => self.delete_patterns.text(),
+            Field::Sample => self.rule_sample.text(),
+            Field::Width => self.width_input.clone(),
+            Field::Lines => self.lines_input.clone(),
+            Field::Model => self.ai.model.clone(),
+            Field::ServerUrl => self.ai.custom_url.clone(),
+        })
+    }
+
+    fn remember_edit(&mut self, field: Field, before: String, after: &str) {
+        let spaces = |text: &str| text.chars().filter(|c| c.is_whitespace()).count();
+        let crossed_word = spaces(after) > spaces(&before);
+        let now = Instant::now();
+        let history = self.histories.entry(field).or_default();
+        let fresh = history.undo.is_empty() || history.boundary || history.last.is_none_or(|last| now - last > UNDO_PAUSE);
+        if fresh {
+            history.undo.push(before);
+            if history.undo.len() > MAX_TEXT_UNDO {
+                history.undo.remove(0);
+            }
+        }
+        history.boundary = crossed_word;
+        history.redo.clear();
+        history.last = Some(now);
+    }
+
+    fn step_history(&mut self, field: Field, redo: bool) -> Task<Message> {
+        let Some(current) = self.field_text(field) else {
+            return Task::none();
+        };
+        let history = self.histories.entry(field).or_default();
+        let Some(target) = (if redo { history.redo.pop() } else { history.undo.pop() }) else {
+            return Task::none();
+        };
+        if redo { history.undo.push(current) } else { history.redo.push(current) }
+        history.last = None;
+        history.boundary = false;
+        self.restoring = true;
+        let task = match field {
+            Field::Reword => self.replace_editor(Message::RewordEdited, target),
+            Field::Instructions => self.replace_editor(Message::AiCustomEdited, target),
+            Field::Protect => self.replace_editor(Message::ProtectEdited, target),
+            Field::Delete => self.replace_editor(Message::DeleteEdited, target),
+            Field::Sample => self.replace_editor(Message::RuleSampleEdited, target),
+            Field::Find => self.update(Message::FindInput(target)),
+            Field::Search => self.update(Message::SearchInput(target)),
+            Field::Palette => self.update(Message::PaletteInput(target)),
+            Field::Width => self.update(Message::SetWidth(target)),
+            Field::Lines => self.update(Message::SetLines(target)),
+            Field::Model => self.update(Message::AiModelInput(target)),
+            Field::ServerUrl => self.update(Message::AiCustomUrlInput(target)),
+        };
+        self.restoring = false;
+        task
+    }
+
+    fn replace_editor(&mut self, make: fn(text_editor::Action) -> Message, text: String) -> Task<Message> {
+        let select = self.update(make(text_editor::Action::SelectAll));
+        let edit = if text.is_empty() {
+            text_editor::Edit::Delete
+        } else {
+            text_editor::Edit::Paste(Arc::new(text))
+        };
+        let put = self.update(make(text_editor::Action::Edit(edit)));
+        Task::batch([select, put])
+    }
+
+    fn probe_undo(&self, redo: bool) -> Task<Message> {
+        iced::advanced::widget::operate(FocusProbe(None)).map(move |focused| Message::UndoIn(focused, redo))
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let tracked = Field::edited_by(&message)
+            .filter(|_| !self.restoring)
+            .and_then(|field| Some((field, self.field_text(field)?)));
+        let task = self.handle(message);
+        if let Some((field, before)) = tracked
+            && let Some(after) = self.field_text(field)
+            && after != before
+        {
+            self.remember_edit(field, before, &after);
+        }
+        task
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::HighlighterReady(Ok(highlighter)) => {
                 let saved = rules::app_settings_path()
@@ -2418,6 +2623,16 @@ impl App {
                 self.save_ai();
                 Task::none()
             }
+            Message::UndoIn(focused, redo) => match focused {
+                Some(Some(id)) => match Field::from_id(&id) {
+                    Some(field) => self.step_history(field, redo),
+                    None => Task::none(),
+                },
+                None if !redo && self.can_undo() && self.reword.is_none() && !self.show_settings => {
+                    self.update(Message::Undo)
+                }
+                _ => Task::none(),
+            },
             Message::ToggleJustChanged => {
                 self.show_just_changed = !self.show_just_changed;
                 self.save_session();
@@ -2489,6 +2704,7 @@ impl App {
                 Task::none()
             }
             Message::OpenPalette => {
+                self.histories.remove(&Field::Palette);
                 self.palette_open = true;
                 self.palette_query.clear();
                 self.palette_selected = 0;
@@ -5306,18 +5522,19 @@ impl App {
         let heading = |label: &'static str, note: &'static str| {
             column![text(label).size(15), text(note).size(12)].spacing(2)
         };
-        let patterns = |content, on_edit: fn(text_editor::Action) -> Message| {
+        let patterns = |content, on_edit: fn(text_editor::Action) -> Message, field: Field| {
             text_editor(content)
+                .id(Id::new(field.id()))
                 .on_action(on_edit)
                 .placeholder("One regular expression per line")
                 .font(Font::with_name("Consolas"))
                 .size(13)
                 .height(64)
         };
-        let number = |label: &'static str, value, on_input: fn(String) -> Message| {
+        let number = |label: &'static str, value, on_input: fn(String) -> Message, field: Field| {
             row![
                 text(label).size(13).width(240),
-                text_input("", value).on_input(on_input).size(13).padding([3, 6]).width(80),
+                text_input("", value).id(Id::new(field.id())).on_input(on_input).size(13).padding([3, 6]).width(80),
             ]
             .align_y(iced::Center)
         };
@@ -5399,6 +5616,7 @@ impl App {
         let mut model_row = row![
             field("Model"),
             text_input(model_placeholder, &self.ai.model)
+                .id(Id::new(Field::Model.id()))
                 .on_input(Message::AiModelInput)
                 .size(13)
                 .padding([3, 6])
@@ -5431,6 +5649,7 @@ impl App {
                 row![
                     field("Server address"),
                     text_input("https://example.com/v1", &self.ai.custom_url)
+                        .id(Id::new(Field::ServerUrl.id()))
                         .on_input(Message::AiCustomUrlInput)
                         .on_submit(Message::AiCustomUrlSubmit)
                         .size(13)
@@ -5464,6 +5683,7 @@ impl App {
         if self.ai.preset == Preset::Custom {
             suggestions = suggestions.push(text("Suggestion Instructions").size(13)).push(
                 text_editor(&self.ai_custom)
+                    .id(Id::new(Field::Instructions.id()))
                     .on_action(Message::AiCustomEdited)
                     .placeholder("How should comments be written?")
                     .size(13)
@@ -5510,7 +5730,7 @@ impl App {
             toggle("Licence and copyright notices", s.protect_licenses, |s| &mut s.protect_licenses),
             toggle("TODO, FIXME, HACK, XXX and BUG notes", s.protect_todos, |s| &mut s.protect_todos),
             text("Also protect comments matching:").size(13),
-            patterns(&self.protect_patterns, Message::ProtectEdited),
+            patterns(&self.protect_patterns, Message::ProtectEdited, Field::Protect),
         ]
         .spacing(8);
 
@@ -5520,15 +5740,15 @@ impl App {
             toggle("It is only a divider, such as // -------", s.delete_dividers, |s| &mut s.delete_dividers),
             toggle("Every line looks like commented-out code (a best guess)", s.delete_commented_code, |s| &mut s.delete_commented_code),
             text("Also delete comments matching:").size(13),
-            patterns(&self.delete_patterns, Message::DeleteEdited),
+            patterns(&self.delete_patterns, Message::DeleteEdited, Field::Delete),
         ]
         .spacing(8);
 
         let squash = column![
             heading("Fix squashes a comment when", "It spans several lines and fits these limits."),
             toggle("Squash comments", s.squash_enabled, |s| &mut s.squash_enabled),
-            number("Result fits within (columns)", self.width_input.as_str(), Message::SetWidth),
-            number("Comment spans at most (lines)", self.lines_input.as_str(), Message::SetLines),
+            number("Result fits within (columns)", self.width_input.as_str(), Message::SetWidth, Field::Width),
+            number("Comment spans at most (lines)", self.lines_input.as_str(), Message::SetLines, Field::Lines),
             toggle("Include doc comments (///, /** */)", s.squash_doc_comments, |s| &mut s.squash_doc_comments),
             toggle("Include bulleted or numbered lists", s.squash_lists, |s| &mut s.squash_lists),
         ]
@@ -5606,6 +5826,7 @@ impl App {
             .spacing(2),
             text("Try a comment:").size(13),
             text_editor(&self.rule_sample)
+                .id(Id::new(Field::Sample.id()))
                 .on_action(Message::RuleSampleEdited)
                 .placeholder("// Paste a comment to see what the rules would do")
                 .font(Font::with_name("Consolas"))
