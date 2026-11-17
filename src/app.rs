@@ -2035,6 +2035,9 @@ impl App {
         };
 
         if modifiers.control() {
+            if key == Key::Named(Named::Enter) && self.reword.is_some() {
+                return self.update(Message::RewordApply);
+            }
             let message = match (letter.as_str(), modifiers.shift()) {
                 ("o", false) => Message::PickFile,
                 ("o", true) => Message::PickFolder,
@@ -4981,8 +4984,13 @@ impl App {
                     .key_binding(|press| {
                         let focused = press.status == text_editor::Status::Focused { is_hovered: false }
                             || press.status == text_editor::Status::Focused { is_hovered: true };
+                        let enter = press.key == Key::Named(Named::Enter)
+                            || matches!(
+                                press.physical_key,
+                                keyboard::key::Physical::Code(keyboard::key::Code::Enter | keyboard::key::Code::NumpadEnter)
+                            );
                         match press.key {
-                            Key::Named(Named::Enter) if focused && press.modifiers.control() => {
+                            _ if enter && focused && press.modifiers.control() => {
                                 Some(text_editor::Binding::Custom(Message::RewordApply))
                             }
                             Key::Named(Named::Escape) if focused => {
