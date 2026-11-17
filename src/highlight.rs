@@ -426,10 +426,15 @@ fn find_hunks(lines: &[Line], syntax: Option<&CommentSyntax>) -> Vec<Hunk> {
                 let only_comment_between =
                     lines[hunk.last + 1..index].iter().all(|l| !l.has_code());
                 if at_line_start && only_comment_between {
+                    let from = if hunk.start <= piece.start && text.is_char_boundary(hunk.start) {
+                        hunk.start
+                    } else {
+                        piece.start
+                    };
                     hunk.last = index;
                     hunk.end = piece.end;
                     hunk.raw.push('\n');
-                    hunk.raw.push_str(body);
+                    hunk.raw.push_str(&text[from..piece.end]);
                     let close = syntax.and_then(|s| s.block.as_ref()).map(|b| b.1.as_str());
                     if close.is_none_or(|c| body.ends_with(c)) {
                         block_open = false;
@@ -488,7 +493,8 @@ fn find_hunks(lines: &[Line], syntax: Option<&CommentSyntax>) -> Vec<Hunk> {
 
     let mut seen: HashMap<u64, u64> = HashMap::new();
     for hunk in &mut hunks {
-        let text_hash = stable_hash(&hunk.raw);
+        let flat: Vec<&str> = hunk.raw.split('\n').map(str::trim_start).collect();
+        let text_hash = stable_hash(&flat.join("\n"));
         let occurrence = seen.entry(text_hash).or_default();
         hunk.key = text_hash ^ occurrence.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         *occurrence += 1;
@@ -567,7 +573,7 @@ pub mod tests {
 
     case!(rust, "rs",
         "let u = \"http://x.y\"; // real\n/* block\n   two */\nlet r = r#\"// no\"#;\nlet c = '/';\n/// doc\nfn f() {}\n",
-        ["// real", "/* block", "two */", "/// doc"]);
+        ["// real", "/* block", "   two */", "/// doc"]);
     case!(typescript, "ts",
         "const s = \"// no\"; // yes\nconst re = /\\/\\/ no/g;\nconst t = `// no ${a /* in */} // no`;\n",
         ["// yes", "/* in */"]);
@@ -642,6 +648,10 @@ pub mod tests {
             (4, 4, HunkKind::LineRun, true),
         ]);
         assert_eq!(d.hunks[0].raw, "/* one\ntwo\nthree */");
+        let indented = doc("x.rs", "/* one\n   two */\n");
+        let flush = doc("x.rs", "/* one\ntwo */\n");
+        assert_eq!(indented.hunks[0].raw, "/* one\n   two */");
+        assert_eq!(indented.hunks[0].key, flush.hunks[0].key);
     }
 
     #[test]

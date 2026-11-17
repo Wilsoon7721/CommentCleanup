@@ -343,6 +343,17 @@ mod tests {
     }
 
     #[test]
+    fn squashes_an_indented_jsdoc_block() {
+        let d = doc("x.ts", "    /**
+     * one
+     *   two
+     */
+    const a = 1;
+");
+        assert_eq!(squash(&d.hunks[0], syntax("typescript")).unwrap(), "/** one two */");
+    }
+
+    #[test]
     fn squashes_a_jsdoc_block() {
         let d = doc("x.ts", "/**\n * One.\n * @param a two\n */\nf();\n");
         assert_eq!(squash(&d.hunks[0], syntax("typescript")).unwrap(), "/** One. @param a two */");
@@ -433,6 +444,16 @@ mod tests {
             replaced("x.rs", "fn a() {\r\n    // one\r\n    // two\r\n    b();\r\n}\r\n", 0, "// both"),
             "fn a() {\r\n    // both\r\n    b();\r\n}\r\n"
         );
+    }
+
+    #[test]
+    fn a_block_comment_keeps_its_inner_indent_when_rewritten_unchanged() {
+        let source = "    /**\n     * one\n     *\n     */\n    fn f() {}\n";
+        let d = doc("x.rs", source);
+        let raw = d.hunks[0].raw.clone();
+        assert_eq!(raw, "/**\n * one\n *\n */");
+        let (body, _) = replace_hunk(source, &d.hunks[0], &raw).unwrap();
+        assert_eq!(body, source);
     }
 
     #[test]
