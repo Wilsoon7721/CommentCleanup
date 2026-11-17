@@ -530,6 +530,7 @@ pub struct App {
     git_again: bool,
     only_changed: bool,
     show_just_changed: bool,
+    keep_tabs: bool,
     histories: HashMap<Field, TextHistory>,
     restoring: bool,
     last_change: Option<JustChanged>,
@@ -726,6 +727,7 @@ pub enum Message {
     AiCustomUrlSubmit,
     AiBatch(bool),
     ToggleJustChanged,
+    SetKeepTabs(bool),
     UndoIn(Option<Option<Id>>, bool),
     JustChangedBack,
     JustChangedUndo,
@@ -884,6 +886,7 @@ impl App {
             git_again: false,
             only_changed: session.only_changed,
             show_just_changed: session.just_changed,
+            keep_tabs: session.keep_tabs,
             histories: HashMap::new(),
             restoring: false,
             last_change: None,
@@ -984,6 +987,7 @@ impl App {
             window: self.placement,
             only_changed: self.only_changed,
             just_changed: self.show_just_changed,
+            keep_tabs: self.keep_tabs,
             manual_updates: !self.auto_update,
             whats_new: self.update_notes.clone(),
         };
@@ -2348,6 +2352,18 @@ impl App {
         iced::advanced::widget::operate(FocusProbe(None)).map(move |focused| Message::UndoIn(focused, redo))
     }
 
+    fn close_all_tabs(&mut self) {
+        self.tabs.clear();
+        self.active = None;
+        self.reword = None;
+        self.suggestion = None;
+        self.plan = None;
+        self.pending_review = None;
+        self.last_change = None;
+        self.find_matches = Arc::new(Vec::new());
+        self.forget_ahead();
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let tracked = Field::edited_by(&message)
             .filter(|_| !self.restoring)
@@ -2429,6 +2445,9 @@ impl App {
                 Message::FolderPicked,
             ),
             Message::FolderPicked(Some(folder)) => {
+                if !self.keep_tabs && self.root.as_ref() != Some(&folder) {
+                    self.close_all_tabs();
+                }
                 self.set_root(folder);
                 self.start_scan()
             }
@@ -2621,6 +2640,11 @@ impl App {
             Message::AiBatch(value) => {
                 self.ai.batch = value;
                 self.save_ai();
+                Task::none()
+            }
+            Message::SetKeepTabs(value) => {
+                self.keep_tabs = value;
+                self.save_session();
                 Task::none()
             }
             Message::UndoIn(focused, redo) => match focused {
@@ -5551,6 +5575,11 @@ impl App {
                 .text_size(13)
                 .size(15)
                 .on_toggle(|_| Message::ToggleJustChanged),
+            checkbox(self.keep_tabs)
+                .label("Keep open files when opening another folder")
+                .text_size(13)
+                .size(15)
+                .on_toggle(Message::SetKeepTabs),
             row![
                 text("Color theme").size(13).width(240),
                 pick_list(themes, Some(&self.theme_name), Message::ThemePicked)
